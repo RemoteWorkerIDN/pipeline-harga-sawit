@@ -1,23 +1,73 @@
 import os
 import json
 import datetime
+import requests
+from bs4 import BeautifulSoup
 import pandas as pd
-import yfinance as yf
 import gspread
 from google.oauth2.service_account import Credentials
 
-def get_commodity_history(ticker_symbol, period="1y"):
-    """Mengambil riwayat data harga penutupan komoditas"""
+def get_investing_price(commodity_type):
+    """
+    Mengambil harga komoditas terkini menggunakan HTTP Request (Scraping Ringan)
+    """
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    
     try:
-        ticker = yf.Ticker(ticker_symbol)
-        hist = ticker.history(period=period)
-        if not hist.empty and 'Close' in hist:
-            df = hist[['Close']].copy()
-            df.index = df.index.strftime('%Y-%m-%d')
-            return df
+        if commodity_type == "OIL":
+            # Data Minyak WTI
+            url = "https://api.investing.com/api/financialdata/assets/equities/8849/historical-data" 
+            # Alternatif parsing langsung dari endpoint open API komoditas
+            res = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/CL=F", headers=headers, timeout=10)
+            data = res.json()
+            price = data['chart']['result'][0]['meta']['regularMarketPrice']
+            return round(float(price), 2)
+            
+        elif commodity_type == "CPO":
+            # Ambil data CPO dari Bursa Malaysia / Trading Economics API public
+            res = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/FCPO=F", headers=headers, timeout=10)
+            data = res.json()
+            price = data['chart']['result'][0]['meta']['regularMarketPrice']
+            return round(float(price), 2)
+            
     except Exception as e:
-        print(f"Gagal mengambil riwayat {ticker_symbol}: {e}")
-    return pd.DataFrame()
+        print(f"Gagal mengambil {commodity_type}: {e}")
+    return "N/A"
+
+def fetch_historical_backup():
+    """Generasi data historis langsung menggunakan endpoint chart JSON"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
+    
+    # Ambil data riwayat WTI Oil 1 Tahun
+    url_oil = "https://query1.finance.yahoo.com/v8/finance/chart/CL=F?range=1y&interval=1d"
+    res_oil = requests.get(url_oil, headers=headers).json()
+    timestamps = res_oil['chart']['result'][0]['timestamp']
+    prices_oil = res_oil['chart']['result'][0]['indicators']['quote'][0]['close']
+    
+    dates = [datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d') for ts in timestamps]
+    
+    df_oil = pd.DataFrame({'Tanggal': dates, 'Crude Oil': prices_oil})
+    df_oil = df_oil.dropna()
+    
+    # Ambil data riwayat CPO 1 Tahun
+    url_cpo = "https://query1.finance.yahoo.com/v8/finance/chart/FCPO=F?range=1y&interval=1d"
+    res_cpo = requests.get(url_cpo, headers=headers).json()
+    
+    try:
+        ts_cpo = res_cpo['chart']['result'][0]['timestamp']
+        prices_cpo = res_cpo['chart']['result'][0]['indicators']['quote'][0]['close']
+        dates_cpo = [datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d') for ts in ts_cpo]
+        df_cpo = pd.DataFrame({'Tanggal': dates_cpo, 'CPO': prices_cpo}).dropna()
+    except:
+        df_cpo = pd.DataFrame(columns=['Tanggal', 'CPO'])
+
+    # Gabungkan Data
+    combined = pd.merge(df_oil, df_cpo, on='Tanggal', how='left').ffill().bfill()
+    return combined
 
 def run_pipeline():
     scopes = [
@@ -33,64 +83,44 @@ def run_pipeline():
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     client = gspread.authorize(creds)
 
-    # Buka Google Sheet
     try:
         spreadsheet = client.open("Data_Komoditas")
     except gspread.exceptions.SpreadsheetNotFound:
         spreadsheets = client.openall()
-        target = [s for s in spreadsheets if s.title == "Data_Komoditas"]
-        if target:
-            spreadsheet = target[0]
-        else:
-            raise Exception("File 'Data_Komoditas' tidak ditemukan!")
+        spreadsheet = [s for s in spreadsheets if s.title == "Data_Komoditas"][0]
 
     sheet = spreadsheet.sheet1
-    existing_records = [r for r in sheet.get_all_values() if any(r)]  # Filter baris yang benar-benar berisi teks
+    all_values = sheet.get_all_values()
+    valid_rows = [r for r in all_values if len(r) > 0 and r[0].strip() != ""]
 
-    # Jika data kurang dari 5 baris (anggap sheet kosong / baru di-reset)
-    if len(existing_records) < 5:
-        print("Sheet dianggap kosong/baru. Memulai download data historis (1 Tahun)...")
+    # Jika Sheet Masih Kosong -> Tarik Historis 1 Tahun
+    if len(valid_rows) <= 2:
+        print("Mulai unduh historis via Direct Web Endpoint...")
+        df_hist = fetch_historical_backup()
         
-        # Tarik data historis 1 tahun
-        oil_df = get_commodity_history("CL=F", period="1y")
-        cpo_df = get_commodity_history("FCPO=F", period="1y")
-        
-        if cpo_df.empty:
-            cpo_df = get_commodity_history("PALMOIL.KL", period="1y")
-
-        # Gabungkan data berdasarkan tanggal
-        combined = pd.merge(cpo_df, oil_df, left_index=True, right_index=True, how='outer', suffixes=('_CPO', '_OIL'))
-        combined = combined.sort_index().ffill().bfill()
-        
-        # Susun data untuk di-upload
         rows_to_insert = [["Tanggal", "CPO", "Crude Oil"]]
-        for date_str, row in combined.iterrows():
-            cpo_val = round(float(row.iloc[0]), 2) if not pd.isna(row.iloc[0]) else "N/A"
-            oil_val = round(float(row.iloc[1]), 2) if not pd.isna(row.iloc[1]) else "N/A"
-            rows_to_insert.append([date_str, cpo_val, oil_val])
-        
-        # Bersihkan & isi ulang seluruh Sheet
+        for _, row in df_hist.iterrows():
+            cpo_val = round(float(row['CPO']), 2) if pd.notna(row['CPO']) else "N/A"
+            oil_val = round(float(row['Crude Oil']), 2) if pd.notna(row['Crude Oil']) else "N/A"
+            rows_to_insert.append([row['Tanggal'], cpo_val, oil_val])
+            
         sheet.clear()
         sheet.update(values=rows_to_insert, range_name="A1")
-        print(f"Berhasil mengunggah {len(rows_to_insert)-1} baris data historis!")
+        print(f"Berhasil mengisi {len(rows_to_insert)-1} baris data historis!")
 
+    # Jika Sudah Ada Data -> Update Harian
     else:
-        print("Data historis sudah ada. Memproses update harian...")
+        print("Melakukan update harian...")
         today_str = datetime.date.today().strftime("%Y-%m-%d")
         
-        oil_recent = get_commodity_history("CL=F", period="5d")
-        cpo_recent = get_commodity_history("FCPO=F", period="5d")
-        if cpo_recent.empty:
-            cpo_recent = get_commodity_history("PALMOIL.KL", period="5d")
-
-        cpo_price = round(float(cpo_recent['Close'].iloc[-1]), 2) if not cpo_recent.empty else "N/A"
-        oil_price = round(float(oil_recent['Close'].iloc[-1]), 2) if not oil_recent.empty else "N/A"
-
-        last_date = existing_records[-1][0]
+        cpo_price = get_investing_price("CPO")
+        oil_price = get_investing_price("OIL")
+        
+        last_date = valid_rows[-1][0]
         row_data = [today_str, cpo_price, oil_price]
 
         if last_date == today_str:
-            row_idx = len(existing_records)
+            row_idx = len(valid_rows)
             sheet.update(values=[row_data], range_name=f"A{row_idx}:C{row_idx}")
             print(f"Update baris tanggal {today_str}: {row_data}")
         else:
