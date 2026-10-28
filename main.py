@@ -38,16 +38,20 @@ def run_pipeline():
         spreadsheet = client.open("Data_Komoditas")
     except gspread.exceptions.SpreadsheetNotFound:
         spreadsheets = client.openall()
-        spreadsheet = [s for s in spreadsheets if s.title == "Data_Komoditas"][0]
+        target = [s for s in spreadsheets if s.title == "Data_Komoditas"]
+        if target:
+            spreadsheet = target[0]
+        else:
+            raise Exception("File 'Data_Komoditas' tidak ditemukan!")
 
     sheet = spreadsheet.sheet1
-    existing_records = sheet.get_all_values()
+    existing_records = [r for r in sheet.get_all_values() if any(r)]  # Filter baris yang benar-benar berisi teks
 
-    # CEK PERTAMA: Jika Sheet masih kosong (hanya ada Header / < 2 baris)
-    if len(existing_records) <= 2:
-        print("Sheet masih kosong. Memulai proses download data historis (1 Tahun)...")
+    # Jika data kurang dari 5 baris (anggap sheet kosong / baru di-reset)
+    if len(existing_records) < 5:
+        print("Sheet dianggap kosong/baru. Memulai download data historis (1 Tahun)...")
         
-        # Tarik data historis 1 tahun untuk Oil & CPO
+        # Tarik data historis 1 tahun
         oil_df = get_commodity_history("CL=F", period="1y")
         cpo_df = get_commodity_history("FCPO=F", period="1y")
         
@@ -56,22 +60,22 @@ def run_pipeline():
 
         # Gabungkan data berdasarkan tanggal
         combined = pd.merge(cpo_df, oil_df, left_index=True, right_index=True, how='outer', suffixes=('_CPO', '_OIL'))
-        combined = combined.sort_index().ffill().bfill()  # Isi nilai kosong
+        combined = combined.sort_index().ffill().bfill()
         
-        # Susun format data baris
+        # Susun data untuk di-upload
         rows_to_insert = [["Tanggal", "CPO", "Crude Oil"]]
         for date_str, row in combined.iterrows():
             cpo_val = round(float(row.iloc[0]), 2) if not pd.isna(row.iloc[0]) else "N/A"
             oil_val = round(float(row.iloc[1]), 2) if not pd.isna(row.iloc[1]) else "N/A"
             rows_to_insert.append([date_str, cpo_val, oil_val])
         
+        # Bersihkan & isi ulang seluruh Sheet
         sheet.clear()
-        sheet.update("A1", rows_to_insert)
+        sheet.update(values=rows_to_insert, range_name="A1")
         print(f"Berhasil mengunggah {len(rows_to_insert)-1} baris data historis!")
 
-    # CEK KEDUA: Jika data historis sudah ada, lakukan Update Harian
     else:
-        print("Data historis ditemukan. Memproses update harian...")
+        print("Data historis sudah ada. Memproses update harian...")
         today_str = datetime.date.today().strftime("%Y-%m-%d")
         
         oil_recent = get_commodity_history("CL=F", period="5d")
@@ -87,7 +91,7 @@ def run_pipeline():
 
         if last_date == today_str:
             row_idx = len(existing_records)
-            sheet.update(f"A{row_idx}:C{row_idx}", [row_data])
+            sheet.update(values=[row_data], range_name=f"A{row_idx}:C{row_idx}")
             print(f"Update baris tanggal {today_str}: {row_data}")
         else:
             sheet.append_row(row_data)
